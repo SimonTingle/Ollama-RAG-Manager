@@ -1,3 +1,7 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python](https://img.shields.io/badge/Python-Server-blue.svg)](https://www.python.org/downloads/)
+[![Status](https://img.shields.io/badge/Status-Beta-orange.svg)](https://github.com)
+
 # **📚 Ollama RAG Manager**
 
 This is a single-file, client-side web application that implements a **Retrieval-Augmented Generation (RAG)** pattern. It allows users to upload local documents and use their content to provide context for a Large Language Model (LLM) running locally via the [Ollama](https://ollama.com/) service.
