@@ -80,3 +80,4 @@ This application is designed for long-term local use:
 * **Users & Documents:** All user profiles and uploaded document contents are stored in your browser's **Local Storage**.  
 * **Multi-User Isolation:** When you **Logout**, the application cleans up the active listener, ensuring that when a different user logs in, they only see documents associated with their specific username. Data remains private and isolated.  
 * **Note on Local Storage:** Data persists across browser restarts and computer reboots, but will be lost if you clear your browser's site data or use Incognito/Private mode.
+* ![Localhost Screenshot](screenshot.png)
