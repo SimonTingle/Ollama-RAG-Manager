@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama RAG Manager (Persistent)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, doc, setDoc, collection, query, onSnapshot, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL CONFIG & ENVIRONMENT VARIABLES ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = (typeof __firebase_config !== 'undefined' && __firebase_config)
+            ? JSON.parse(__firebase_config)
+            : {};
+        
+        const OLLAMA_URL = 'http://localhost:11434/api/generate';
+        const OLLAMA_TAGS_URL = 'http://localhost:11434/api/tags';
+
+        // --- APPLICATION STATE ---
+        let db;
+        let loggedInUser = null;
+        let documents = [];
+        let selectedDocIds = new Set();
+        let isRealDatabase = false;
+        let unsubscribeDocsListener = null; // NEW: Track the listener so we can stop it
+
+        // --- MOCK DATABASE ADAPTER (Uses LocalStorage for Persistence) ---
+        class MockDB {
+            constructor() {
+                // CHANGED: Use localStorage instead of sessionStorage for persistence across reloads
+                this.storage = window.localStorage;
+                console.log("[MockDB] Initialized using Local Storage (Persistent).");
+            }
+
+            _getPath(collection, id) {
+                return `mock_db_${collection}_${id}`;
+            }
+
+            async setDoc(collectionName, docId, data) {
+                const key = this._getPath(collectionName, docId);
+                this.storage.setItem(key, JSON.stringify(data));
+                return Promise.resolve();
+            }
+
+            async getDoc(collectionName, docId) {
+                const key = this._getPath(collectionName, docId);
+                const data = this.storage.getItem(key);
+                return Promise.resolve({
+                    exists: () => !!data,
+                    data: () => data ? JSON.parse(data) : null
+                });
+            }
+
+            mockListenToDocs(username, callback) {
+                const prefix = `mock_db_user_docs_${username}_`;
+                
+                const fetchDocs = () => {
+                    const docs = [];
+                    for (let i = 0; i < this.storage.length; i++) {
+                        const key = this.storage.key(i);
+                        if (key.startsWith(prefix)) {
+                            try {
+                                const data = JSON.parse(this.storage.getItem(key));
+                                const id = key.replace(prefix, '');
+                                docs.push({ id, ...data });
+                            } catch (e) {
+                                console.warn("Skipping corrupted doc:", key);
+                            }
+                        }
+                    }
+                    callback(docs);
+                };
+
+                fetchDocs();
+                const interval = setInterval(fetchDocs, 1000);
+                return () => clearInterval(interval);
+            }
+        }
+        
+        const mockDB = new MockDB();
+
+        // --- UTILITY: PASSWORD HASHING ---
+        async function sha256(message) {
+            if (window.crypto && window.crypto.subtle) {
+                try {
+                    const msgBuffer = new TextEncoder().encode(message);
+                    const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+                    const hashArray = Array.from(new Uint8Array(hashBuffer));
+                    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+                } catch (e) {
+                    console.warn("WebCrypto present but failed (insecure context?), using fallback.");
+                }
+            }
+            // Fallback
+            let hash = 0;
+            for (let i = 0; i < message.length; i++) {
+                hash = ((hash << 5) - hash) + message.charCodeAt(i);
+                hash |= 0;
+            }
+            return "fallback_" + Math.abs(hash).toString(16);
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            checkOllamaStatus();
+            const authStatusEl = document.getElementById('authStatus');
+
+            if (Object.keys(firebaseConfig).length === 0 || !firebaseConfig.projectId) {
+                 isRealDatabase = false;
+                 db = mockDB;
+                 authStatusEl.innerHTML = 'Mode: <span class="text-yellow-600 font-bold">Local Storage (Mock DB)</span>';
+                 console.warn("[App] Config missing. Using Persistent Local Storage.");
+            } else {
+                isRealDatabase = true;
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                authStatusEl.innerHTML = 'Mode: <span class="text-green-600 font-bold">Cloud Firestore</span>';
+            }
+
+            const savedUser = localStorage.getItem('rag_logged_in_user');
+            if (savedUser) {
+                loggedInUser = savedUser;
+                renderAppScreen('rag');
+                setupDocumentListener();
+            } else {
+                renderAppScreen('login');
+            }
+        });
+
+        // --- SCREEN RENDERING ---
+        function renderAppScreen(screen) {
+            document.getElementById('loginScreen').classList.add('hidden');
+            document.getElementById('signupScreen').classList.add('hidden');
+            document.getElementById('ragAppScreen').classList.add('hidden');
+            
+            if (screen === 'login') {
+                document.getElementById('loginScreen').classList.remove('hidden');
+            } else if (screen === 'signup') {
+                document.getElementById('signupScreen').classList.remove('hidden');
+            } else if (screen === 'rag') {
+                document.getElementById('ragAppScreen').classList.remove('hidden');
+                document.getElementById('currentUserDisplay').textContent = loggedInUser;
+                setupDropAreaListeners();
+            }
+        }
+
+        // --- AUTH LOGIC ---
+        const USER_PROFILES_COLLECTION = 'user_profiles';
+
+        async function handleSignUp(event) {
+            event.preventDefault();
+            const username = document.getElementById('signupUsername').value.trim();
+            const password = document.getElementById('signupPassword').value;
+            const statusEl = document.getElementById('signupStatus');
+            statusEl.textContent = 'Creating account...';
+            statusEl.className = 'mt-4 text-center text-sm font-medium text-blue-600';
+
+            if (!username || !password) {
+                statusEl.textContent = 'Please enter both username and password.';
+                statusEl.className = 'mt-4 text-center text-sm font-medium text-red-500';
+                return;
+            }
+
+            const usernameLower = username.toLowerCase();
+            const hashedPassword = await sha256(password);
+            const userData = {
+                username: username,
+                hashedPassword: hashedPassword,
+                createdAt: new Date().toISOString(),
+            };
+
+            try {
+                if (isRealDatabase) {
+                    const userRef = doc(db, USER_PROFILES_COLLECTION, usernameLower);
+                    const docSnap = await getDoc(userRef);
+                    if (docSnap.exists()) throw new Error("Username already exists.");
+                    await setDoc(userRef, userData);
+                } else {
+                    const existing = await mockDB.getDoc(USER_PROFILES_COLLECTION, usernameLower);
+                    if (existing.exists()) throw new Error("User already exists in Local Storage.");
+                    await mockDB.setDoc(USER_PROFILES_COLLECTION, usernameLower, userData);
+                }
+                
+                statusEl.textContent = 'Success! Account created. Please Log In.';
+                statusEl.className = 'mt-4 text-center text-sm font-bold text-green-600';
+                
+                // Auto-fill login form for convenience
+                document.getElementById('loginUsername').value = username;
+                
+                setTimeout(() => renderAppScreen('login'), 1500);
+
+            } catch (error) {
+                console.error("Signup Error:", error);
+                statusEl.textContent = error.message;
+                statusEl.className = 'mt-4 text-center text-sm font-medium text-red-500';
+            }
+        }
+        
+        async function handleLogin(event) {
+            event.preventDefault();
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value;
+            const statusEl = document.getElementById('loginStatus');
+            statusEl.textContent = 'Verifying...';
+            statusEl.className = 'mt-4 text-center text-sm font-medium text-gray-500';
+
+            const usernameLower = username.toLowerCase();
+            const inputHash = await sha256(password);
+
+            try {
+                let retrievedData = null;
+
+                if (isRealDatabase) {
+                    const userRef = doc(db, USER_PROFILES_COLLECTION, usernameLower);
+                    const docSnap = await getDoc(userRef);
+                    if (docSnap.exists()) retrievedData = docSnap.data();
+                } else {
+                    const docSnap = await mockDB.getDoc(USER_PROFILES_COLLECTION, usernameLower);
+                    if (docSnap.exists()) retrievedData = docSnap.data();
+                }
+
+                if (retrievedData && retrievedData.hashedPassword === inputHash) {
+                    loggedInUser = retrievedData.username;
+                    localStorage.setItem('rag_logged_in_user', loggedInUser);
+                    renderAppScreen('rag');
+                    setupDocumentListener();
+                } else {
+                    throw new Error("Invalid username or password. Did you Sign Up?");
+                }
+
+            } catch (error) {
+                console.error("Login Error:", error);
+                statusEl.textContent = error.message;
+                statusEl.className = 'mt-4 text-center text-sm font-medium text-red-500';
+            }
+        }
+        
+        function handleLogout() {
+            // FIXED: Stop listening to the previous user's documents immediately
+            if (unsubscribeDocsListener) {
+                unsubscribeDocsListener();
+                unsubscribeDocsListener = null;
+                console.log("[App] Unsubscribed from document listener.");
+            }
+
+            loggedInUser = null;
+            localStorage.removeItem('rag_logged_in_user');
+            documents = [];
+            selectedDocIds.clear();
+            renderDocuments();
+            renderAppScreen('login');
+        }
+
+        // --- OLLAMA LOGIC ---
+        async function checkOllamaStatus() {
+            const statusElement = document.getElementById('ollamaStatus');
+            const modelPicker = document.getElementById('modelPicker');
+            const errorDetails = document.getElementById('ollamaErrorDetails');
+            
+            statusElement.textContent = 'Checking...';
+            modelPicker.innerHTML = '<option>Loading...</option>';
+            
+            try {
+                const controller = new AbortController();
+                setTimeout(() => controller.abort(), 2000);
+                const response = await fetch(OLLAMA_TAGS_URL, { signal: controller.signal });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    const models = data.models || [];
+                    statusElement.innerHTML = `<span class="text-green-600 font-bold">Online</span> (${models.length} models)`;
+                    errorDetails.classList.add('hidden');
+                    document.getElementById('ragButton').disabled = false;
+                    
+                    modelPicker.innerHTML = '';
+                    if (models.length > 0) {
+                        models.forEach((m, i) => {
+                            const opt = document.createElement('option');
+                            opt.value = m.name;
+                            opt.textContent = m.name;
+                            if (i===0 || m.name.includes('llama3')) opt.selected = true;
+                            modelPicker.appendChild(opt);
+                        });
+                    } else {
+                        modelPicker.innerHTML = '<option>No models found</option>';
+                    }
+                } else { throw new Error("Status " + response.status); }
+            } catch (e) {
+                statusElement.innerHTML = '<span class="text-red-500 font-bold">Offline</span>';
+                document.getElementById('ragButton').disabled = true;
+                modelPicker.innerHTML = '<option>Offline</option>';
+                errorDetails.textContent = `Ensure Ollama is running with OLLAMA_ORIGINS="http://localhost:8000"`;
+                errorDetails.classList.remove('hidden');
+            }
+        }
+
+        async function runRAG() {
+            const query = document.getElementById('ragQuery').value;
+            const output = document.getElementById('ragOutput');
+            const model = document.getElementById('modelPicker').value;
+
+            const activeDocuments = documents.filter(doc => selectedDocIds.has(doc.id));
+
+            if (!query) {
+                output.innerHTML = `<div class="text-red-500">Please enter a question.</div>`;
+                return;
+            }
+            if (activeDocuments.length === 0) {
+                output.innerHTML = `<div class="text-red-500">Please select at least one document to use as context.</div>`;
+                return;
+            }
+
+            output.innerHTML = '<div class="animate-pulse text-blue-600">Thinking (using ' + activeDocuments.length + ' docs)...</div>';
+            
+            const context = activeDocuments.map(d => `--- Document: ${d.name} ---\n${d.content}\n`).join('\n');
+            const prompt = `Use these documents to answer the question. If unsure, say so.\n\n<DOCUMENTS>\n${context}\n</DOCUMENTS>\n\nQuestion: ${query}`;
+
+            try {
+                const res = await fetch(OLLAMA_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model, prompt, stream: false })
+                });
+                const json = await res.json();
+                output.innerHTML = `<div class="prose text-gray-800">${json.response}</div>`;
+            } catch (e) {
+                output.innerHTML = `<div class="text-red-500">Error: ${e.message}</div>`;
+            }
+        }
+
+        // --- DOCUMENT LOGIC ---
+        function getDocumentPath(username) {
+            return `/artifacts/${appId}/public/data/user_documents/${username.toLowerCase()}/docs`;
+        }
+
+        function setupDocumentListener() {
+            // FIXED: Ensure we clean up any existing listener before starting a new one
+            if (unsubscribeDocsListener) {
+                unsubscribeDocsListener();
+                unsubscribeDocsListener = null;
+            }
+
+            if (!loggedInUser) return;
+
+            const onUpdate = (docs) => {
+                documents = docs;
+                renderDocuments();
+            };
+
+            if (isRealDatabase) {
+                const path = getDocumentPath(loggedInUser);
+                // Store the unsubscribe function returned by onSnapshot
+                unsubscribeDocsListener = onSnapshot(query(collection(db, path)), (snapshot) => {
+                    const docs = [];
+                    snapshot.forEach(doc => docs.push({ id: doc.id, ...doc.data() }));
+                    onUpdate(docs);
+                });
+            } else {
+                // Store the unsubscribe function returned by our MockDB
+                unsubscribeDocsListener = mockDB.mockListenToDocs(loggedInUser.toLowerCase(), onUpdate);
+            }
+        }
+
+        async function handleFileDrop(e) {
+            e.preventDefault();
+            document.getElementById('dropArea').classList.remove('border-blue-500', 'bg-blue-50');
+            const status = document.getElementById('dropStatus');
+            
+            if (!loggedInUser) return;
+            
+            const file = e.dataTransfer.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = async (event) => {
+                const content = event.target.result;
+                let isBinaryWarning = false;
+                if (content.includes('\u0000')) isBinaryWarning = true;
+
+                if (isBinaryWarning) {
+                    status.textContent = `⚠️ Warning: ${file.name} appears to be binary. Parsing might fail.`;
+                    status.classList.add('text-yellow-600');
+                } else {
+                    status.textContent = `Processing ${file.name}...`;
+                    status.classList.remove('text-yellow-600', 'text-red-500');
+                }
+
+                const docId = crypto.randomUUID();
+                const docData = {
+                    name: file.name,
+                    fileType: file.type,
+                    content: content,
+                    size: content.length,
+                    timestamp: new Date().toISOString()
+                };
+
+                // FIXED: Auto-select this new document immediately
+                selectedDocIds.add(docId);
+
+                if (isRealDatabase) {
+                    const path = getDocumentPath(loggedInUser);
+                    await setDoc(doc(collection(db, path), docId), docData);
+                } else {
+                    const mockKey = `user_docs_${loggedInUser.toLowerCase()}_`;
+                    await mockDB.setDoc(mockKey, docId, docData);
+                }
+                status.textContent = "Saved!";
+                status.classList.add('text-green-600');
+                renderDocuments(); // Re-render to show selection
+            };
+            reader.readAsText(file);
+        }
+
+        // --- UI HELPERS ---
+        function toggleSelection(docId) {
+            if (selectedDocIds.has(docId)) {
+                selectedDocIds.delete(docId);
+            } else {
+                selectedDocIds.add(docId);
+            }
+            updateStats();
+        }
+
+        function updateStats() {
+            const activeDocs = documents.filter(d => selectedDocIds.has(d.id));
+            const totalChars = activeDocs.reduce((sum, d) => sum + d.size, 0);
+            const estTokens = Math.round(totalChars / 4);
+            
+            const statsEl = document.getElementById('contextStats');
+            statsEl.innerHTML = `Selected: <span class="font-bold">${activeDocs.length}</span> docs (~${estTokens} tokens)`;
+            
+            if (estTokens > 8000) {
+                statsEl.classList.add('text-red-600');
+                statsEl.innerHTML += ' <span class="text-xs font-bold ml-1">OVERLOAD WARNING</span>';
+            } else {
+                statsEl.classList.remove('text-red-600');
+            }
+        }
+
+        function renderDocuments() {
+            documents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+            document.getElementById('docList').innerHTML = documents.map(d => {
+                const isChecked = selectedDocIds.has(d.id) ? 'checked' : '';
+                return `
+                <div class="p-2 bg-gray-50 border rounded text-sm flex items-center gap-3 hover:bg-gray-100 transition">
+                    <input type="checkbox" ${isChecked} onchange="window.toggleSelection('${d.id}')" class="w-4 h-4 text-blue-600 rounded cursor-pointer">
+                    <div class="flex-1 min-w-0">
+                        <div class="flex justify-between items-baseline">
+                            <span class="truncate font-medium text-gray-800" title="${d.name}">${d.name}</span>
+                            <span class="text-gray-500 text-xs ml-2 whitespace-nowrap">${(d.size/1024).toFixed(1)}KB</span>
+                        </div>
+                        <div class="text-xs text-gray-400 truncate">${new Date(d.timestamp).toLocaleTimeString()}</div>
+                    </div>
+                </div>`;
+            }).join('') || '<p class="text-gray-400 text-sm italic text-center p-4">No documents yet.</p>';
+            
+            updateStats();
+        }
+
+        window.handleLogin = handleLogin;
+        window.handleSignUp = handleSignUp;
+        window.handleLogout = handleLogout;
+        window.renderAppScreen = renderAppScreen;
+        window.runRAG = runRAG;
+        window.toggleSelection = toggleSelection;
+        
+        function setupDropAreaListeners() {
+            const da = document.getElementById('dropArea');
+            da.ondragover = (e) => { e.preventDefault(); da.classList.add('border-blue-500', 'bg-blue-50'); };
+            da.ondragleave = (e) => { e.preventDefault(); da.classList.remove('border-blue-500', 'bg-blue-50'); };
+            da.ondrop = handleFileDrop;
+        }
+    </script>
+</head>
+<body class="bg-gray-50 min-h-screen font-sans text-gray-900">
+    <div class="max-w-5xl mx-auto p-6">
+        <header class="flex justify-between items-center mb-8 border-b pb-4">
+            <div>
+                <h1 class="text-3xl font-extrabold text-blue-700">Ollama RAG <span class="text-gray-800 text-xl font-normal">Manager</span></h1>
+                <p id="authStatus" class="text-xs mt-1 text-gray-500">Initializing...</p>
+            </div>
+            <div class="text-right">
+                <div class="text-sm font-semibold">Ollama Status</div>
+                <div id="ollamaStatus" class="text-sm">Checking...</div>
+                <div id="ollamaErrorDetails" class="text-xs text-red-500 hidden max-w-xs"></div>
+            </div>
+        </header>
+
+        <!-- Login Screen -->
+        <div id="loginScreen" class="hidden max-w-md mx-auto bg-white p-8 rounded-xl shadow-md border">
+            <h2 class="text-2xl font-bold mb-6">Login</h2>
+            <form onsubmit="window.handleLogin(event)">
+                <input id="loginUsername" type="text" placeholder="Username" class="w-full mb-4 p-3 border rounded" required>
+                <input id="loginPassword" type="password" placeholder="Password" class="w-full mb-6 p-3 border rounded" required>
+                <button type="submit" class="w-full bg-blue-600 text-white p-3 rounded font-bold hover:bg-blue-700">Login</button>
+            </form>
+            <p id="loginStatus" class="mt-4 text-center text-sm text-red-500"></p>
+            <p class="mt-4 text-center text-sm">No account? <button onclick="window.renderAppScreen('signup')" class="text-blue-600 underline">Sign up</button></p>
+        </div>
+
+        <!-- Signup Screen -->
+        <div id="signupScreen" class="hidden max-w-md mx-auto bg-white p-8 rounded-xl shadow-md border">
+            <h2 class="text-2xl font-bold mb-6">Create Account</h2>
+            <form onsubmit="window.handleSignUp(event)">
+                <input id="signupUsername" type="text" placeholder="Choose Username" class="w-full mb-4 p-3 border rounded" required>
+                <input id="signupPassword" type="password" placeholder="Choose Password" class="w-full mb-6 p-3 border rounded" required>
+                <button type="submit" class="w-full bg-green-600 text-white p-3 rounded font-bold hover:bg-green-700">Sign Up</button>
+            </form>
+            <p id="signupStatus" class="mt-4 text-center text-sm text-red-500"></p>
+            <p class="mt-4 text-center text-sm">Have an account? <button onclick="window.renderAppScreen('login')" class="text-blue-600 underline">Log in</button></p>
+        </div>
+
+        <!-- Main RAG Screen -->
+        <div id="ragAppScreen" class="hidden grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <!-- Sidebar -->
+            <div class="lg:col-span-1 space-y-6">
+                <div class="bg-white p-5 rounded-xl shadow-sm border flex flex-col h-[calc(100vh-200px)]">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="font-bold text-gray-700">Your Documents</h3>
+                        <button onclick="window.handleLogout()" class="text-xs text-red-500 hover:underline">Logout</button>
+                    </div>
+                    <div class="mb-4 text-xs text-gray-500">User: <span id="currentUserDisplay" class="font-mono font-bold text-black"></span></div>
+                    
+                    <div id="dropArea" class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:bg-gray-50 transition mb-4 bg-gray-50">
+                        <div class="text-2xl mb-2">📄</div>
+                        <p class="text-xs text-gray-500">Drag & Drop Text Files</p>
+                    </div>
+                    <p id="dropStatus" class="text-xs text-center min-h-[1rem] mb-2 font-medium"></p>
+
+                    <!-- Context Stats Header -->
+                    <div class="text-xs bg-gray-100 p-2 rounded mb-2 border text-center" id="contextStats">
+                        Selected: 0 docs (~0 tokens)
+                    </div>
+
+                    <div id="docList" class="space-y-2 overflow-y-auto flex-1 pr-1"></div>
+                </div>
+            </div>
+
+            <!-- Chat Area -->
+            <div class="lg:col-span-2 space-y-6">
+                <div class="bg-white p-6 rounded-xl shadow-sm border h-full flex flex-col">
+                    <div class="mb-4 flex items-center justify-between">
+                        <h2 class="text-xl font-bold">Ask Question</h2>
+                        <select id="modelPicker" class="text-sm border rounded p-1 max-w-[150px]"></select>
+                    </div>
+                    
+                    <textarea id="ragQuery" rows="3" class="w-full p-3 border rounded-lg mb-4 resize-none focus:ring-2 focus:ring-blue-500 focus:outline-none" placeholder="Based on my selected documents, what is..."></textarea>
+                    
+                    <button id="ragButton" onclick="window.runRAG()" class="w-full bg-blue-600 text-white py-2 rounded-lg font-bold hover:bg-blue-700 disabled:opacity-50 transition">Generate Answer</button>
+
+                    <div class="mt-6 flex-1 flex flex-col">
+                        <h3 class="text-sm font-bold text-gray-500 mb-2 uppercase tracking-wide">Response</h3>
+                        <div id="ragOutput" class="bg-gray-50 p-4 rounded-lg border flex-1 text-sm leading-relaxed overflow-y-auto max-h-[400px]">
+                            <span class="text-gray-400 italic">Output will appear here...</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

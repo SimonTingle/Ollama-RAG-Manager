@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama RAG with Custom Authentication</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        // Only need getFirestore and related functions for data storage/retrieval
+        import { getFirestore, doc, setDoc, collection, query, onSnapshot, getDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL CONFIG & ENVIRONMENT VARIABLES ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = (typeof __firebase_config !== 'undefined' && __firebase_config)
+            ? JSON.parse(__firebase_config)
+            : {};
+        
+        // Ollama Endpoint
+        const OLLAMA_URL = 'http://localhost:11434/api/generate';
+        const OLLAMA_TAGS_URL = 'http://localhost:11434/api/tags';
+
+        // --- APPLICATION STATE ---
+        let db;
+        let loggedInUser = null;
+        let documents = [];
+        let isDatabaseEnabled = true;
+
+        // --- UTILITY: SIMULATED PASSWORD HASHING ---
+        // WARNING: This client-side hashing is for demonstration only and is NOT secure for production.
+        async function sha256(message) {
+            const msgBuffer = new TextEncoder().encode(message);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+            return hashHex;
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            // Check Ollama status immediately
+            checkOllamaStatus();
+            
+            const authStatusEl = document.getElementById('authStatus');
+
+            // --- DATABASE CHECK AND FALLBACK LOGIC ---
+            if (Object.keys(firebaseConfig).length === 0 || !firebaseConfig.projectId) {
+                 isDatabaseEnabled = false;
+                 authStatusEl.textContent = 'Auth Blocked: Firebase config is missing. Authentication/Document storage is disabled.';
+                 authStatusEl.classList.add('text-red-600');
+                 console.error("[Auth Status] Firebase configuration missing. Custom Auth and Document Storage is DISABLED.");
+                 // We still render the login screen to show the error state
+                 renderAppScreen('login');
+            } else {
+                // 1. Initialize Firebase (without auth services)
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                console.log("[Firebase Init] Firestore service initialized.");
+                
+                // Check if a user is in session storage
+                const savedUser = sessionStorage.getItem('rag_logged_in_user');
+                if (savedUser) {
+                    loggedInUser = savedUser;
+                    renderAppScreen('rag');
+                    setupDocumentListener();
+                } else {
+                    renderAppScreen('login');
+                }
+            }
+        });
+
+        // --- SCREEN RENDERING ---
+
+        function renderAppScreen(screen) {
+            document.getElementById('loginScreen').classList.add('hidden');
+            document.getElementById('signupScreen').classList.add('hidden');
+            document.getElementById('ragAppScreen').classList.add('hidden');
+            
+            const authStatusEl = document.getElementById('authStatus');
+
+            if (screen === 'login') {
+                document.getElementById('loginScreen').classList.remove('hidden');
+                if (isDatabaseEnabled) {
+                    authStatusEl.innerHTML = `Custom Auth Status: <span class="text-red-500 font-bold">Logged Out</span>`;
+                }
+            } else if (screen === 'signup') {
+                document.getElementById('signupScreen').classList.remove('hidden');
+            } else if (screen === 'rag') {
+                document.getElementById('ragAppScreen').classList.remove('hidden');
+                authStatusEl.innerHTML = `Logged in as: <span class="text-green-600 font-mono font-bold">${loggedInUser}</span>`;
+                setupDropAreaListeners();
+            }
+        }
+
+        // --- CUSTOM AUTH LOGIC ---
+        
+        const USER_PROFILES_COLLECTION = 'user_profiles';
+
+        async function handleSignUp(event) {
+            event.preventDefault();
+            const username = document.getElementById('signupUsername').value.trim();
+            const password = document.getElementById('signupPassword').value;
+            const statusEl = document.getElementById('signupStatus');
+            statusEl.textContent = '';
+            statusEl.classList.remove('text-green-600', 'text-red-500');
+
+            if (!isDatabaseEnabled) {
+                 statusEl.textContent = 'Error: Firebase database is not configured. Signup is disabled.';
+                 statusEl.classList.add('text-red-500');
+                 return;
+            }
+
+            if (!username || !password) {
+                statusEl.textContent = 'Please enter both username and password.';
+                statusEl.classList.add('text-red-500');
+                return;
+            }
+
+            const usernameLower = username.toLowerCase();
+            const userRef = doc(db, USER_PROFILES_COLLECTION, usernameLower);
+
+            try {
+                const docSnap = await getDoc(userRef);
+                if (docSnap.exists()) {
+                    statusEl.textContent = 'Error: Username already exists.';
+                    statusEl.classList.add('text-red-500');
+                    return;
+                }
+                
+                const hashedPassword = await sha256(password);
+
+                await setDoc(userRef, {
+                    username: username, // Store original casing
+                    hashedPassword: hashedPassword,
+                    createdAt: new Date().toISOString(),
+                });
+                
+                statusEl.textContent = 'Account created successfully! Redirecting to login...';
+                statusEl.classList.add('text-green-600');
+                setTimeout(() => renderAppScreen('login'), 1500);
+
+            } catch (error) {
+                console.error("Signup Error:", error);
+                statusEl.textContent = `Signup failed: ${error.message}`;
+                statusEl.classList.add('text-red-500');
+            }
+        }
+        
+        async function handleLogin(event) {
+            event.preventDefault();
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value;
+            const statusEl = document.getElementById('loginStatus');
+            statusEl.textContent = 'Logging in...';
+            statusEl.classList.remove('text-green-600', 'text-red-500');
+            statusEl.classList.add('text-gray-500');
+
+
+            if (!isDatabaseEnabled) {
+                 statusEl.textContent = 'Error: Firebase database is not configured. Login is disabled.';
+                 statusEl.classList.remove('text-gray-500');
+                 statusEl.classList.add('text-red-500');
+                 return;
+            }
+
+            if (!username || !password) {
+                statusEl.textContent = 'Please enter both username and password.';
+                statusEl.classList.remove('text-gray-500');
+                statusEl.classList.add('text-red-500');
+                return;
+            }
+
+            const usernameLower = username.toLowerCase();
+            const userRef = doc(db, USER_PROFILES_COLLECTION, usernameLower);
+
+            try {
+                const docSnap = await getDoc(userRef);
+                
+                if (!docSnap.exists()) {
+                    statusEl.textContent = 'Error: Invalid username or password.';
+                    statusEl.classList.remove('text-gray-500');
+                    statusEl.classList.add('text-red-500');
+                    return;
+                }
+                
+                const userData = docSnap.data();
+                const inputHashedPassword = await sha256(password);
+
+                if (inputHashedPassword === userData.hashedPassword) {
+                    loggedInUser = userData.username; // Use the stored original casing
+                    sessionStorage.setItem('rag_logged_in_user', loggedInUser);
+                    statusEl.textContent = `Welcome, ${loggedInUser}!`;
+                    statusEl.classList.remove('text-gray-500');
+                    statusEl.classList.add('text-green-600');
+                    
+                    setTimeout(() => {
+                        renderAppScreen('rag');
+                        setupDocumentListener();
+                    }, 500);
+                } else {
+                    statusEl.textContent = 'Error: Invalid username or password.';
+                    statusEl.classList.remove('text-gray-500');
+                    statusEl.classList.add('text-red-500');
+                }
+
+            } catch (error) {
+                console.error("Login Error:", error);
+                statusEl.textContent = `Login failed: ${error.message}`;
+                statusEl.classList.remove('text-gray-500');
+                statusEl.classList.add('text-red-500');
+            }
+        }
+        
+        function handleLogout() {
+            loggedInUser = null;
+            sessionStorage.removeItem('rag_logged_in_user');
+            documents = []; // Clear documents on logout
+            renderDocuments();
+            renderAppScreen('login');
+        }
+
+        // --- OLLAMA STATUS & ERROR HANDLING ---
+
+        async function checkOllamaStatus() {
+            const statusElement = document.getElementById('ollamaStatus');
+            const modelPicker = document.getElementById('modelPicker');
+            const ragModelDisplay = document.getElementById('ragModelDisplay');
+
+            statusElement.textContent = 'Checking Ollama status...';
+            statusElement.classList.replace('text-red-500', 'text-yellow-600');
+            const errorDetails = document.getElementById('ollamaErrorDetails');
+            errorDetails.classList.add('hidden');
+            
+            modelPicker.innerHTML = '<option value="">Loading models...</option>';
+            ragModelDisplay.textContent = 'N/A';
+            
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+
+                const response = await fetch(OLLAMA_TAGS_URL, { signal: controller.signal });
+                clearTimeout(timeoutId);
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    const models = data.models ? data.models.map(m => m.name) : [];
+                    const modelNames = models.join(', ') || 'None found.';
+                    
+                    statusElement.innerHTML = `Ollama: <span class="font-bold">Online</span>. Models: ${modelNames}. RAG Ready.`;
+                    statusElement.classList.replace('text-yellow-600', 'text-green-600');
+                    document.getElementById('ragButton').disabled = false;
+                    
+                    modelPicker.innerHTML = '';
+                    
+                    if (models.length > 0) {
+                        models.forEach((name, index) => {
+                            const option = document.createElement('option');
+                            option.value = name;
+                            option.textContent = name;
+                            if (index === 0 || name.includes('llama3')) {
+                                option.selected = true;
+                                ragModelDisplay.textContent = name;
+                            }
+                            modelPicker.appendChild(option);
+                        });
+                        
+                        modelPicker.addEventListener('change', () => {
+                            ragModelDisplay.textContent = modelPicker.value;
+                        });
+
+                    } else {
+                         statusElement.innerHTML = 'Ollama: <span class="font-bold">Online</span>. <span class="text-red-500">No models available.</span> RAG Disabled.';
+                         document.getElementById('ragButton').disabled = true;
+                         modelPicker.innerHTML = '<option value="">-- No Models --</option>';
+                         ragModelDisplay.textContent = 'None';
+                    }
+
+                } else {
+                    throw new Error(`Ollama responded with status ${response.status}`);
+                }
+            } catch (error) {
+                console.error("Ollama check failed:", error);
+                statusElement.innerHTML = 'Ollama: <span class="font-bold">Offline or inaccessible</span>.';
+                statusElement.classList.replace('text-yellow-600', 'text-red-500');
+                document.getElementById('ragButton').disabled = true;
+                modelPicker.innerHTML = '<option value="">-- Offline --</option>';
+                ragModelDisplay.textContent = 'Offline';
+                
+                errorDetails.textContent = `Error: Could not connect to Ollama at ${OLLAMA_URL}. Please ensure Ollama is running AND has the 'OLLAMA_ORIGINS=http://localhost:8000' variable set before starting it.`;
+                errorDetails.classList.remove('hidden');
+            }
+        }
+
+        // --- FILE PARSING & DOCUMENT MANAGEMENT ---
+        
+        /**
+         * Generates the Firestore path based on the logged-in user's custom username.
+         * Path: /artifacts/{appId}/public/data/user_documents/{username}/docs
+         */
+        function getDocumentPath(username) {
+            return `/artifacts/${appId}/public/data/user_documents/${username.toLowerCase()}/docs`;
+        }
+
+        function setupDocumentListener() {
+            if (!loggedInUser || !db) {
+                documents = [];
+                renderDocuments();
+                return;
+            }
+
+            const path = getDocumentPath(loggedInUser);
+            const docsRef = collection(db, path);
+            const q = query(docsRef);
+
+            onSnapshot(q, (snapshot) => {
+                documents = [];
+                snapshot.forEach(doc => {
+                    documents.push({ id: doc.id, ...doc.data() });
+                });
+                renderDocuments();
+                console.log(`[Firestore] Successfully loaded ${documents.length} documents for user: ${loggedInUser}.`);
+            }, (error) => {
+                console.error("[Firestore] Listener Error:", error);
+                document.getElementById('docList').innerHTML = `<p class="text-red-500">Error loading documents: ${error.message}</p>`;
+            });
+        }
+        
+        function setupDropAreaListeners() {
+            const dropArea = document.getElementById('dropArea');
+            // Remove previous listeners to prevent duplicates
+            dropArea.removeEventListener('dragover', handleDragOver);
+            dropArea.removeEventListener('dragleave', handleDragLeave);
+            dropArea.removeEventListener('drop', handleFileDrop);
+
+            // Add new listeners
+            dropArea.addEventListener('dragover', handleDragOver);
+            dropArea.addEventListener('dragleave', handleDragLeave);
+            dropArea.addEventListener('drop', handleFileDrop);
+        }
+
+        function handleDragOver(e) {
+            e.preventDefault();
+            document.getElementById('dropArea').classList.add('border-blue-500', 'bg-blue-50');
+        }
+
+        function handleDragLeave(e) {
+            e.preventDefault();
+            document.getElementById('dropArea').classList.remove('border-blue-500', 'bg-blue-50');
+        }
+
+        function handleFileDrop(e) {
+            e.preventDefault();
+            const dropArea = document.getElementById('dropArea');
+            dropArea.classList.remove('border-blue-500', 'bg-blue-50');
+            const dropStatus = document.getElementById('dropStatus');
+            dropStatus.classList.remove('text-red-500', 'text-green-600', 'text-yellow-600');
+
+            if (!loggedInUser) {
+                dropStatus.textContent = 'Error: Not logged in.';
+                dropStatus.classList.add('text-red-500');
+                return;
+            }
+
+            const files = e.dataTransfer.files;
+            if (files.length === 0) return;
+
+            const file = files[0];
+            dropStatus.textContent = `Attempting to parse file: ${file.name} (${file.type})...`;
+
+            const reader = new FileReader();
+            
+            reader.onload = async (event) => {
+                const content = event.target.result;
+                
+                let isBinaryWarning = false;
+                if (file.type && !file.type.startsWith('text/') && !file.type.includes('json') && !file.type.includes('xml')) {
+                    isBinaryWarning = true;
+                } else if (content.length > 0 && content.includes('\u0000')) {
+                    isBinaryWarning = true;
+                }
+
+                if (isBinaryWarning) {
+                    dropStatus.innerHTML = `⚠️ Warning: '${file.name}' (${file.type}) is a binary file. Client-side parsing failed and may contain garbage. Only text-based content is saved for RAG.`;
+                    dropStatus.classList.add('text-yellow-600');
+                }
+                
+                await saveDocumentToFirestore(file.name, file.type, content);
+                dropStatus.innerHTML += `<br>Success! Saved '${file.name}' to the private database for user <span class="font-bold">${loggedInUser}</span>.`;
+                dropStatus.classList.remove('text-yellow-600');
+                dropStatus.classList.add('text-green-600');
+            };
+            
+            reader.onerror = () => {
+                dropStatus.textContent = `Error reading file: ${file.name}. This usually means it's a proprietary binary format.`;
+                dropStatus.classList.add('text-red-500');
+            };
+            
+            reader.readAsText(file);
+        }
+
+        async function saveDocumentToFirestore(fileName, fileType, content) {
+            if (!loggedInUser || !db) return;
+
+            const path = getDocumentPath(loggedInUser);
+            const docId = crypto.randomUUID();
+            
+            const documentData = {
+                name: fileName,
+                fileType: fileType,
+                content: content,
+                size: content.length,
+                timestamp: new Date().toISOString()
+            };
+
+            try {
+                await setDoc(doc(collection(db, path), docId), documentData);
+                console.log(`[Firestore] Document saved: ${fileName} for user ${loggedInUser}`);
+            } catch (error) {
+                console.error("[Firestore] Save Error:", error);
+                document.getElementById('dropStatus').textContent = `Error saving '${fileName}': ${error.message}`;
+                document.getElementById('dropStatus').classList.add('text-red-500');
+            }
+        }
+
+        function renderDocuments() {
+            const docList = document.getElementById('docList');
+            if (documents.length === 0) {
+                docList.innerHTML = '<p class="text-gray-500 italic">No documents uploaded yet. Drag and drop a text file above!</p>';
+                return;
+            }
+
+            documents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            
+            docList.innerHTML = documents.map(doc => `
+                <div class="p-3 bg-white border border-gray-200 rounded-lg shadow-sm flex justify-between items-center text-sm">
+                    <span class="font-medium text-gray-800 truncate">${doc.name}</span>
+                    <span class="text-xs text-gray-500 ml-4 flex-shrink-0">${(doc.size / 1024).toFixed(2)} KB (${doc.fileType.split('/')[1] || 'text'})</span>
+                </div>
+            `).join('');
+        }
+        
+        // --- RAG CHAT LOGIC (OLLAMA) ---
+        
+        async function runRAG() {
+            const query = document.getElementById('ragQuery').value;
+            const output = document.getElementById('ragOutput');
+            const button = document.getElementById('ragButton');
+            const modelPicker = document.getElementById('modelPicker');
+
+            const selectedModel = modelPicker.value;
+
+            if (!query || documents.length === 0) {
+                output.innerHTML = `<div class="text-red-500 p-3 bg-red-50 rounded-lg">Please enter a query and upload at least one document first.</div>`;
+                return;
+            }
+
+            if (!selectedModel) {
+                 output.innerHTML = `<div class="text-red-500 p-3 bg-red-50 rounded-lg">No Ollama model is currently selected or available.</div>`;
+                 return;
+            }
+
+            button.disabled = true;
+            output.innerHTML = '<div class="flex items-center space-x-2 text-blue-600"><div class="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-600"></div><span>Generating grounded response via Ollama...</span></div>';
+            
+            // 1. CONSTRUCT CONTEXT (Retrieval)
+            const documentContext = documents.map(d =>
+                `--- Document: ${d.name} (${d.fileType}) ---\n${d.content}\n---------------------------\n`
+            ).join('\n\n');
+
+            const systemPrompt = `You are a helpful and intelligent AI assistant. Use the following documents, enclosed in <DOCUMENTS> tags, as your sole source of knowledge. Answer the user's question accurately and concisely based ONLY on the provided context. If the information is not present in the documents, state clearly that you cannot find the answer in the provided context.`;
+            
+            const fullPrompt = `${systemPrompt}\n\n<DOCUMENTS>\n${documentContext}\n</DOCUMENTS>\n\nUser Question: ${query}`;
+            
+            const payload = {
+                model: selectedModel,
+                prompt: fullPrompt,
+                stream: false
+            };
+            
+            // 2. CALL OLLAMA API (Generation)
+            try {
+                const response = await fetch(OLLAMA_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(`Ollama API error (${response.status}): ${errorData.error || response.statusText}`);
+                }
+
+                const result = await response.json();
+                const generatedText = result.response || "No response received.";
+                
+                output.innerHTML = `<div class="bg-white p-4 rounded-lg border border-green-200 text-gray-800">${generatedText}</div>`;
+
+            } catch (error) {
+                console.error("Ollama RAG Error:", error);
+                output.innerHTML = `<div class="text-red-500 bg-red-100 p-4 rounded-lg">RAG Error: ${error.message}<br>Check if Ollama is running and the model (${selectedModel}) is pulled.</div>`;
+            } finally {
+                button.disabled = false;
+            }
+        }
+
+        window.handleLogin = handleLogin;
+        window.handleSignUp = handleSignUp;
+        window.handleLogout = handleLogout;
+        window.renderAppScreen = renderAppScreen;
+        window.runRAG = runRAG;
+    </script>
+    <style>
+        body { font-family: ui-sans-serif, system-ui, sans-serif; }
+        .card { box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06); }
+        .drop-area { transition: all 0.2s; }
+        .animate-spin { animation: spin 1s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="p-4 sm:p-8 bg-gray-50 min-h-screen">
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-4xl font-extrabold text-gray-900 mb-8">
+            <span class="text-blue-600">Ollama RAG</span> Document Manager
+        </h1>
+
+        <!-- Status & Authentication Section -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+            <div class="p-4 card rounded-xl bg-white border border-gray-200">
+                <p class="text-sm font-semibold text-gray-700">User Status</p>
+                <p id="authStatus" class="mt-1 text-sm text-red-500 font-medium">Initializing...</p>
+            </div>
+            <div class="p-4 card rounded-xl bg-white border border-gray-200 col-span-2">
+                <p class="text-sm font-semibold text-gray-700">Ollama Status (<code class="font-mono">http://localhost:11434</code>)</p>
+                <p id="ollamaStatus" class="mt-1 text-sm text-yellow-600 font-medium">Checking Ollama status...</p>
+                <p id="ollamaErrorDetails" class="hidden mt-2 text-xs text-red-500"></p>
+            </div>
+        </div>
+
+        <!-- --- Authentication Screens --- -->
+
+        <!-- Login Screen -->
+        <div id="loginScreen" class="hidden max-w-lg mx-auto p-8 card rounded-xl bg-white border border-gray-200">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-6">Login to Access Your Documents</h2>
+            <form onsubmit="window.handleLogin(event)">
+                <div class="mb-4">
+                    <label for="loginUsername" class="block text-sm font-medium text-gray-700">Username</label>
+                    <input type="text" id="loginUsername" class="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" required>
+                </div>
+                <div class="mb-6">
+                    <label for="loginPassword" class="block text-sm font-medium text-gray-700">Password</label>
+                    <input type="password" id="loginPassword" class="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" required>
+                </div>
+                <button type="submit" class="w-full py-3 px-6 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 transition duration-300">
+                    Login
+                </button>
+            </form>
+            <p id="loginStatus" class="mt-4 text-center text-sm font-medium"></p>
+            <div class="mt-6 text-center text-sm">
+                Don't have an account?
+                <button onclick="window.renderAppScreen('signup')" class="text-blue-600 hover:underline font-medium">Sign Up Here</button>
+            </div>
+            <div class="mt-6 p-3 bg-red-100 border border-red-300 text-red-800 text-xs rounded-lg">
+                **SECURITY WARNING:** This client-side login is for **demonstration ONLY**. Passwords are hashed in the browser but this method is NOT secure for production due to reliance on client-side code.
+            </div>
+        </div>
+
+        <!-- Signup Screen -->
+        <div id="signupScreen" class="hidden max-w-lg mx-auto p-8 card rounded-xl bg-white border border-gray-200">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-6">Create New Account</h2>
+            <form onsubmit="window.handleSignUp(event)">
+                <div class="mb-4">
+                    <label for="signupUsername" class="block text-sm font-medium text-gray-700">Username</label>
+                    <input type="text" id="signupUsername" class="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" required>
+                </div>
+                <div class="mb-6">
+                    <label for="signupPassword" class="block text-sm font-medium text-gray-700">Password</label>
+                    <input type="password" id="signupPassword" class="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" required>
+                </div>
+                <button type="submit" class="w-full py-3 px-6 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 transition duration-300">
+                    Sign Up
+                </button>
+            </form>
+            <p id="signupStatus" class="mt-4 text-center text-sm font-medium"></p>
+            <div class="mt-6 text-center text-sm">
+                Already have an account? 
+                <button onclick="window.renderAppScreen('login')" class="text-blue-600 hover:underline font-medium">Log In Here</button>
+            </div>
+        </div>
+
+        <!-- --- Main RAG Application Screen --- -->
+        <div id="ragAppScreen" class="hidden">
+            <div class="flex justify-end mb-4">
+                <button onclick="window.handleLogout()" class="py-2 px-4 text-sm bg-red-500 text-white font-medium rounded-lg hover:bg-red-600 transition duration-300">
+                    Logout
+                </button>
+            </div>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <!-- Left Column: Document Upload & List -->
+                <div class="space-y-6">
+                    <div class="p-6 card rounded-xl bg-white border border-gray-200">
+                        <h2 class="text-2xl font-semibold text-gray-800 mb-4">1. Private Document Database</h2>
+                        
+                        <!-- Drag & Drop Area -->
+                        <div id="dropArea" class="drop-area border-4 border-dashed border-gray-300 rounded-xl p-8 text-center cursor-pointer mb-4">
+                            <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 014 4v2a4 4 0 01-4 4h-4"/>
+                            </svg>
+                            <p class="mt-2 text-sm text-gray-600 font-semibold">Drag and drop ANY file here (TXT, JSON, etc.)</p>
+                            <p class="text-xs text-gray-500">Only text content will be extracted and saved to your private document storage.</p>
+                        </div>
+                        <p id="dropStatus" class="text-sm font-medium text-gray-600 text-center"></p>
+                        <div class="mt-4 p-3 bg-yellow-50 border border-yellow-200 text-yellow-800 text-xs rounded-lg">
+                            **Note on Binary Files (PDF/DOCX):** Due to browser security, complex files cannot be parsed client-side. This demo attempts to read as plain text, but real-world RAG systems require a **server-side parser** for accurate extraction.
+                        </div>
+                    </div>
+
+                    <!-- Document List -->
+                    <div class="p-6 card rounded-xl bg-white border border-gray-200">
+                        <h2 class="text-xl font-semibold text-gray-800 mb-4">My Parsed Documents (RAG Context)</h2>
+                        <div id="docList" class="space-y-3">
+                            <p class="text-gray-500 italic">Loading documents...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right Column: RAG Chat Interface -->
+                <div class="space-y-6">
+                    <div class="p-6 card rounded-xl bg-white border border-gray-200">
+                        <h2 class="text-2xl font-semibold text-gray-800 mb-4">2. Ask a Grounded Question</h2>
+                        
+                        <!-- Model Picker -->
+                        <div class="mb-4">
+                            <label for="modelPicker" class="block text-sm font-medium text-gray-700 mb-2">Select Ollama Model:</label>
+                            <select id="modelPicker" class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                                <option value="">Loading models...</option>
+                            </select>
+                            <p class="text-gray-600 mt-2 text-xs">RAG will run using: <code id="ragModelDisplay" class="font-mono font-bold text-blue-600">N/A</code></p>
+                        </div>
+
+                        <textarea id="ragQuery" rows="3" placeholder="Ask a question that can only be answered using the content of your uploaded documents..." class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 text-base resize-none mb-4"></textarea>
+
+                        <button id="ragButton" onclick="window.runRAG()" disabled class="w-full py-3 px-6 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 transition duration-300 disabled:opacity-50">
+                            Generate Grounded Answer (Run RAG)
+                        </button>
+                    </div>
+                    
+                    <!-- RAG Output -->
+                    <div class="p-6 card rounded-xl bg-gray-100 border border-gray-200 min-h-48">
+                        <h2 class="text-xl font-semibold text-gray-800 mb-4">3. Ollama RAG Output</h2>
+                        <div id="ragOutput" class="text-gray-700">
+                            <p class="text-gray-500 italic">The response from Ollama, grounded in your documents, will appear here.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>
